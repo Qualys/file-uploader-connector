@@ -1,0 +1,8 @@
+{
+  "header": 1,
+  "baseUrl": "https://yourapi.example.com",
+  "username": "your_username",
+  "password": "your_password",
+  "connectionUuid": "your_connection_uuid",
+  "profileUuid": "your_profile_uuid"
+}
