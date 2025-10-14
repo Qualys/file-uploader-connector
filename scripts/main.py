@@ -8,7 +8,7 @@ import json
 import requests
 import csv
 from pathlib import Path
-from bunch import Bunch
+from box import Box
 from tenacity import (
     RetryError,
     before_sleep_log,
@@ -47,7 +47,7 @@ def parse_arguments(csv_path):
                 data = json.load(file)
                 if csv_path:
                     data["csvPath"] = csv_path
-                return Bunch(data)
+                return Box(data)
         except FileNotFoundError:
             logging.error("Config file not found.")
             raise
@@ -76,6 +76,15 @@ def parse_arguments(csv_path):
         "--password", type=str, required=True, help="Password for authentication"
     )
     parser.add_argument(
+        "--OAuthClientLevel", type=str, required=False, help="OAuth client level for authentication.Possible values: USER,SUBSCRIPTION"
+    )
+    parser.add_argument(
+        "--clientId", type=str, required=False, help="Client_id for authentication"
+    )
+    parser.add_argument(
+        "--clientSecret", type=str, required=False, help="Client_secret for authentication"
+    )
+    parser.add_argument(
         "--connectionUuid", type=str, required=True, help="Connection UUID"
     )
     parser.add_argument("--profileUuid", type=str, required=True, help="Profile UUID")
@@ -91,6 +100,18 @@ def parse_arguments(csv_path):
         required=False,
         help="Environment variable name for password (optional)",
     )
+    parser.add_argument(
+        "--envQualysclientIdProperty",
+        type=str,
+        required=False,
+        help="Environment variable name for client id (optional)",
+    )
+    parser.add_argument(
+        "--envQualysClientSecretProperty",
+        type=str,
+        required=False,
+        help="Environment variable name for client secret (optional)",
+   )
 
     return parser.parse_args()
 
@@ -103,9 +124,14 @@ class CsvUploader:
         self.BASE_URL = args.baseUrl
         self.USERNAME = getattr(args, "username", None)
         self.PASSWORD = getattr(args, "password", None)
+        self.O_AUTH_CLIENT_LEVEL = getattr(args, "OAuthClientLevel", None)
+        self.CLIENT_ID = getattr(args, "clientId", None)
+        self.CLIENT_SECRET = getattr(args, "clientSecret", None)
         self.CONNECTION_UUID = args.connectionUuid
         self.PROFILE_UUID = args.profileUuid
         self.QAS_JWT_TOKEN_URI = "/auth"
+        self.QAS_USER_LEVEL_OAUTH_JWT_TOKEN_URI = "/auth/oidc"
+        self.QAS_SUBSCRIPTION_LEVEL_OAUTH_JWT_TOKEN_URI = "/auth/oauth"
         self.PROCESSED_DIR = "uploaded"
         self.envQualysUsernameProperty = getattr(
             args, "envQualysUsernameProperty", None
@@ -113,8 +139,20 @@ class CsvUploader:
         self.envQualysPasswordProperty = getattr(
             args, "envQualysPasswordProperty", None
         )
-        self._fill_username_password()
-        self.generated_jwt = self._generate_jwt()
+        self.envQualysclientIdProperty = getattr(
+            args, "envQualysclientIdProperty", None
+        )
+        self.envQualysClientSecretProperty = getattr(
+            args, "envQualysClientSecretProperty", None
+        )
+        if not self.O_AUTH_CLIENT_LEVEL:
+            self._fill_username_password()
+            self.generated_jwt = self._generate_jwt()
+
+        else:
+            self._fill_client_id_client_secret()
+            self._validate_client_credentials()
+            self.generated_jwt = self._generate_jwt_with_client_id_and_client_secret()
 
     def _fill_username_password(self):
         if (
@@ -128,6 +166,27 @@ class CsvUploader:
                 raise RuntimeError(
                     "Env properties were provided but not set for username password"
                 )
+    def _fill_client_id_client_secret(self):
+        if (
+                self.envQualysclientIdProperty is not None
+                and self.envQualysClientSecretProperty is not None
+        ):
+            logging.info("Reading client id and client secret from env variables")
+            self.CLIENT_ID = os.getenv(self.envQualysclientIdProperty)
+            self.CLIENT_SECRET = os.getenv(self.envQualysClientSecretProperty)
+            if self.CLIENT_ID is None or self.CLIENT_SECRET is None:
+                raise RuntimeError(
+                    "Env properties were provided but not set for Client id and Client secret"
+                )
+
+    def _validate_client_credentials(self):
+        if not self.CLIENT_ID:
+            logging.error("Missing client_id.")
+            raise ValueError("client_id must be provided and cannot be empty when OAuthClientLevel is used.")
+
+        if not self.CLIENT_SECRET:
+            logging.error("Missing client_secret.")
+            raise ValueError("client_secret must be provided and cannot be empty when OAuthClientLevel is used.")
 
     def _generate_jwt(self):
         url = f"{self.BASE_URL}{self.QAS_JWT_TOKEN_URI}"
@@ -139,6 +198,33 @@ class CsvUploader:
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
             response = requests.post(url, headers=headers, data=payload, verify=False)
+            response.raise_for_status()
+            logging.info("JWT Generated Successfully !!")
+            return response.text
+        except requests.RequestException as e:
+            logging.error(f"JWT generation failed: {str(e)}")
+            raise
+
+    def _generate_jwt_with_client_id_and_client_secret(self):
+        valid_types = {"USER", "SUBSCRIPTION"}
+        if self.O_AUTH_CLIENT_LEVEL not in valid_types:
+            logging.error(f"Invalid O_AUTH_CLIENT_LEVEL: '{self.O_AUTH_CLIENT_LEVEL}'. Expected one of {valid_types}.")
+            raise ValueError(f"O_AUTH_CLIENT_LEVEL must be one of {valid_types}, but got '{self.O_AUTH_CLIENT_LEVEL}'.")
+
+        if self.O_AUTH_CLIENT_LEVEL == "USER":
+            url = f"{self.BASE_URL}{self.QAS_USER_LEVEL_OAUTH_JWT_TOKEN_URI}"
+        elif self.O_AUTH_CLIENT_LEVEL == "SUBSCRIPTION":
+            url = f"{self.BASE_URL}{self.QAS_SUBSCRIPTION_LEVEL_OAUTH_JWT_TOKEN_URI}"
+
+        headers = {
+            "Content-Type":"application/x-www-form-urlencoded",
+            "clientId": self.CLIENT_ID,
+            "clientSecret": self.CLIENT_SECRET,
+            "encrypted": "rsa512",
+        }
+
+        try:
+            response = requests.post(url, headers=headers, verify=False)
             response.raise_for_status()
             logging.info("JWT Generated Successfully !!")
             return response.text
@@ -188,7 +274,10 @@ class CsvUploader:
             logging.info(f"File {chunk_file_path} uploaded successfully!")
             return response
         elif response.status_code == 401:
-            self.generated_jwt = self._generate_jwt()
+            if not self.O_AUTH_CLIENT_LEVEL:
+                self.generated_jwt = self._generate_jwt()
+            else:
+                self.generated_jwt = self._generate_jwt_with_client_id_and_client_secret()
             raise Exception(
                 f"Upload failed with status code {response.status_code}, regenerating JWT token"
             )
