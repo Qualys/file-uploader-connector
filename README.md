@@ -1,4 +1,4 @@
-# File Uploader Connector
+# CSV Chunk Uploader
 
 This Python script processes a CSV file, splits it into chunks, and uploads these chunks to a specified gateway URL. It uses JSON configuration if available, otherwise relies on command-line arguments..
 
@@ -38,10 +38,13 @@ The `CsvUploader` class in `main.py` handles the following functionalities:
        {
            "header": 1,
            "baseUrl": "https://yourapi.example.com",
-           "username": "your_username",
-           "password": "your_password",
+           "username": "your_username [OPTIONAL if OAUTH is used]",
+           "password": "your_password [OPTIONAL if OAUTH is used]",
            "connectionUuid": "your_connection_uuid",
            "profileUuid": "your_profile_uuid",
+           "OAuthClientLevel": "your_client_level USER or SUBSCRIPTION [OPTIONAL if username and password is used]",
+           "clientId": "your_client_id [OPTIONAL if username and password is used]",
+           "clientSecret": "your_client_secret [OPTIONAL if username and password is used]",
            "envQualysUsernameProperty": "ENV_QUALYS_USERNAME",
            "envQualysPasswordProperty": "ENV_QUALYS_PASSWORD"
        }
@@ -56,6 +59,11 @@ The `CsvUploader` class in `main.py` handles the following functionalities:
      cd connector-config-automation
      python3 main.py --header <header-line> --csvPath <csv-file-path> --baseUrl <base-url> --username <username> --password <password> --profileUuid <profile-uuid> --connectionUuid <connection-uuid>
    ```
+**To run the script using OAuth credentials, use the following command:**
+  ```bash
+     cd connector-config-automation
+     python3 main.py --header <header-line> --csvPath <csv-file-path> --baseUrl <base-url> --OAuthClientLevel <OAuthClientLevel> --clientId <clientId> --clientSecret <clientSecret> --profileUuid <profile-uuid> --connectionUuid <connection-uuid>
+   ```
 **The above command will use configuration from created config.json file**
 
 *If config.json is not provided use the following command line args:*
@@ -67,6 +75,9 @@ The `CsvUploader` class in `main.py` handles the following functionalities:
 - `--password`: Qualys Password for authentication (optional, if you provide value for envQualysPasswordProperty property we will read it from env).
 - `--connectionUuid`: Connection UUID (required, this will be available on connector UI).
 - `--profileUuid`: Profile UUID (required, this will be available on connector UI).
+- `--OAuthClientLevel`: Qualys OAuth client level (optional, if username or password is used.).
+- `--clientId`: Qualys OAuth client ID (optional, if username or password is used.).
+- `--clientSecret`: Qualys OAuth client ID (optional, if username or password is used.).
 - `--envQualysUsernameProperty`: Environment variable name for username (optional).
 - `--envQualysPasswordProperty`: Environment variable name for password (optional).
 
