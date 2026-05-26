@@ -299,7 +299,7 @@ class CsvUploader:
             headers = next(csv_file_reader)
             for row in csv_file_reader:
                 row_size = len(",".join(row).encode("utf-8")) + 1
-                chunk.append(row)
+                
 
                 if current_chunk_size + row_size > self.MAX_CHUNK_SIZE:
                     chunk_index += 1
