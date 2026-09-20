@@ -197,7 +197,7 @@ class CsvUploader:
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
-            response = requests.post(url, headers=headers, data=payload, verify=False)
+            response = requests.post(url, headers=headers, data=payload)
             response.raise_for_status()
             logging.info("JWT Generated Successfully !!")
             return response.text
@@ -224,7 +224,7 @@ class CsvUploader:
         }
 
         try:
-            response = requests.post(url, headers=headers, verify=False)
+            response = requests.post(url, headers=headers)
             response.raise_for_status()
             logging.info("JWT Generated Successfully !!")
             return response.text
@@ -264,7 +264,6 @@ class CsvUploader:
                     f"{self.BASE_URL}/connector-config/connector/integration/{self.CONNECTION_UUID}/{self.PROFILE_UUID}/file-upload",
                     files=files,
                     headers=headers,
-                    verify=False,
                 )
             except requests.RequestException as e:
                 logging.error(f"Error uploading file {chunk_filename}: {str(e)}")
