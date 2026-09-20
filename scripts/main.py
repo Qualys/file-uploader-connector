@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -288,7 +289,6 @@ class CsvUploader:
     def process_and_upload_chunks(self):
         output_dir, filename = self._prepare_output_directory()
         chunk = []
-        current_chunk_size = 0
         chunk_index = 0
         with open(file=self.CSV_PATH, mode="r", encoding="utf-8") as file:
             csv_file_reader = csv.reader(
@@ -297,11 +297,11 @@ class CsvUploader:
             for _ in range(self.HEADER - 1):
                 next(csv_file_reader)
             headers = next(csv_file_reader)
+            current_chunk_size = self._csv_row_size(headers)
             for row in csv_file_reader:
-                row_size = len(",".join(row).encode("utf-8")) + 1
-                
+                row_size = self._csv_row_size(row)
 
-                if current_chunk_size + row_size > self.MAX_CHUNK_SIZE:
+                if chunk and current_chunk_size + row_size > self.MAX_CHUNK_SIZE:
                     chunk_index += 1
                     chunk_filename = self._write_chunk(
                         chunk, chunk_index, headers, filename, output_dir
@@ -317,6 +317,13 @@ class CsvUploader:
                     chunk, chunk_index, headers, filename, output_dir
                 )
                 self.upload_csv_file(chunk_filename, output_dir)
+
+    @staticmethod
+    def _csv_row_size(row):
+        """Return the UTF-8 size of a row as serialized by csv.writer."""
+        buffer = io.StringIO(newline="")
+        csv.writer(buffer, quotechar='"', quoting=csv.QUOTE_MINIMAL).writerow(row)
+        return len(buffer.getvalue().encode("utf-8"))
 
     def _write_chunk(self, chunk, chunk_index, headers, filename, output_dir):
         chunk_filename = f"{filename}_{chunk_index}.csv"
