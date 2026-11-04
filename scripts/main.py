@@ -3,10 +3,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import shutil
+import sys
 from datetime import datetime
 import json
 import requests
 import csv
+import uuid
 from pathlib import Path
 from box import Box
 from tenacity import (
@@ -15,8 +17,15 @@ from tenacity import (
     retry,
     wait_exponential,
     stop_after_attempt,
-    retry_if_exception_type,
+    retry_if_not_exception_type,
 )
+
+# (connect, read) timeout in seconds for each chunk upload request.
+REQUEST_TIMEOUT = (10, 300)
+
+
+class NonRetryableUploadError(Exception):
+    """4xx other than 401 - retrying will not help."""
 
 
 def setup_logging(log_file_path, MAX_LOG_SIZE=10 * 1024 * 1024, BACKUP_COUNT=5):
@@ -129,6 +138,10 @@ class CsvUploader:
         self.CLIENT_SECRET = getattr(args, "clientSecret", None)
         self.CONNECTION_UUID = args.connectionUuid
         self.PROFILE_UUID = args.profileUuid
+        # Single execution UUID for the entire CSV file. All chunks generated from
+        # this file are uploaded under this same UUID so the backend groups them
+        # into one execution instead of creating a new execution per chunk.
+        self.EXECUTION_UUID = str(uuid.uuid4())
         self.QAS_JWT_TOKEN_URI = "/auth"
         self.QAS_USER_LEVEL_OAUTH_JWT_TOKEN_URI = "/auth/oidc"
         self.QAS_SUBSCRIPTION_LEVEL_OAUTH_JWT_TOKEN_URI = "/auth/oauth"
@@ -232,48 +245,59 @@ class CsvUploader:
             logging.error(f"JWT generation failed: {str(e)}")
             raise
 
-    def upload_csv_file(self, chunk_filename, output_dir):
+    def upload_csv_file(self, chunk_filename, output_dir, chunk_index, last_chunk):
         processed_chunk_path = os.path.join(
             output_dir, self.PROCESSED_DIR, chunk_filename
         )
         chunk_file_path = os.path.join(output_dir, chunk_filename)
         try:
-            self.upload_call(chunk_file_path, chunk_filename)
-            # move files to uploaded file to know which files are processed
-            shutil.move(chunk_file_path, processed_chunk_path)
-            logging.info(f"Moved {chunk_filename} to {processed_chunk_path}.")
-        except RetryError:
+            self.upload_call(chunk_file_path, chunk_filename, chunk_index, last_chunk)
+        except (RetryError, NonRetryableUploadError) as e:
             logging.error(
-                f"Failed to upload {chunk_file_path} after multiple attempts "
+                f"Failed to upload {chunk_file_path} (chunk {chunk_index}): {e}"
             )
+            return False
+        # move files to uploaded file to know which files are processed
+        shutil.move(chunk_file_path, processed_chunk_path)
+        logging.info(f"Moved {chunk_filename} to {processed_chunk_path}.")
+        return True
 
     @retry(
         wait=wait_exponential(
             multiplier=10,
         ),
         stop=stop_after_attempt(3),
-        retry=retry_if_exception_type(Exception),
-        before_sleep=before_sleep_log(logging, logging.INFO),  # type: ignore
+        retry=retry_if_not_exception_type(NonRetryableUploadError),
+        before_sleep=before_sleep_log(logging.getLogger(), logging.INFO),  # type: ignore
     )
-    def upload_call(self, chunk_file_path, chunk_filename):
+    def upload_call(self, chunk_file_path, chunk_filename, chunk_index, last_chunk):
         with open(chunk_file_path, "rb") as f:
             files = {"file": (chunk_filename, f, "text/csv")}
-            headers = {"Authorization": f"Bearer {self.generated_jwt}"}
+            headers = {
+                "Authorization": f"Bearer {self.generated_jwt}",
+                "executionUuid": self.EXECUTION_UUID,
+                "chunkIndex": str(chunk_index),
+                "lastChunk": "true" if last_chunk else "false",
+            }
             try:
                 response = requests.post(
                     f"{self.BASE_URL}/connector-config/connector/integration/{self.CONNECTION_UUID}/{self.PROFILE_UUID}/file-upload",
                     files=files,
                     headers=headers,
                     verify=False,
+                    timeout=REQUEST_TIMEOUT,
                 )
             except requests.RequestException as e:
                 logging.error(f"Error uploading file {chunk_filename}: {str(e)}")
                 raise
 
         if response.status_code == 200:
-            logging.info(f"File {chunk_file_path} uploaded successfully!")
+            logging.info(
+                f"File {chunk_file_path} uploaded (execution_uuid={self.EXECUTION_UUID}, "
+                f"chunk={chunk_index}, last={last_chunk})"
+            )
             return response
-        elif response.status_code == 401:
+        if response.status_code == 401:
             if not self.O_AUTH_CLIENT_LEVEL:
                 self.generated_jwt = self._generate_jwt()
             else:
@@ -281,32 +305,49 @@ class CsvUploader:
             raise Exception(
                 f"Upload failed with status code {response.status_code}, regenerating JWT token"
             )
-        else:
-            logging.warning(f"Upload failed for {chunk_file_path}: - {response.text}")
-            raise Exception(f"Upload failed status code {response.status_code}")
+        if 400 <= response.status_code < 500:
+            # 400 bad headers, 403 connector inactive, 413 too large ... retrying will not help
+            raise NonRetryableUploadError(
+                f"status {response.status_code}: {response.text}"
+            )
+        logging.warning(f"Upload failed for {chunk_file_path}: - {response.text}")
+        raise Exception(f"Upload failed status code {response.status_code}")
 
     def process_and_upload_chunks(self):
+        """Returns True when every chunk was uploaded."""
         output_dir, filename = self._prepare_output_directory()
+        logging.info(
+            f"Uploading {self.CSV_PATH} with execution_uuid={self.EXECUTION_UUID}"
+        )
         chunk = []
         current_chunk_size = 0
         chunk_index = 0
-        with open(file=self.CSV_PATH, mode="r", encoding="utf-8") as file:
+        with open(file=self.CSV_PATH, mode="r", encoding="utf-8-sig", newline="") as file:
             csv_file_reader = csv.reader(
                 file, quotechar='"', quoting=csv.QUOTE_MINIMAL
             )  # Handle quoted CSV
             for _ in range(self.HEADER - 1):
                 next(csv_file_reader)
-            headers = next(csv_file_reader)
+            headers = next(csv_file_reader, None)
+            if headers is None:
+                logging.error("CSV file is empty.")
+                return False
             for row in csv_file_reader:
                 row_size = len(",".join(row).encode("utf-8")) + 1
-                
 
-                if current_chunk_size + row_size > self.MAX_CHUNK_SIZE:
+                # Flush the current chunk before adding this row if it would exceed
+                # the limit, so the row starts the next chunk. The flushed chunk is
+                # never the last one: at least this row still follows it.
+                if chunk and current_chunk_size + row_size > self.MAX_CHUNK_SIZE:
                     chunk_index += 1
                     chunk_filename = self._write_chunk(
                         chunk, chunk_index, headers, filename, output_dir
                     )
-                    self.upload_csv_file(chunk_filename, output_dir)
+                    if not self.upload_csv_file(chunk_filename, output_dir, chunk_index, last_chunk=False):
+                        logging.error(
+                            "Stopping: later chunks are not uploaded so the file is not partially ingested."
+                        )
+                        return False
                     chunk = []
                     current_chunk_size = 0
                 chunk.append(row)
@@ -316,13 +357,15 @@ class CsvUploader:
                 chunk_filename = self._write_chunk(
                     chunk, chunk_index, headers, filename, output_dir
                 )
-                self.upload_csv_file(chunk_filename, output_dir)
+                return self.upload_csv_file(chunk_filename, output_dir, chunk_index, last_chunk=True)
+        logging.warning("CSV file has a header but no data rows; nothing uploaded.")
+        return True
 
     def _write_chunk(self, chunk, chunk_index, headers, filename, output_dir):
         chunk_filename = f"{filename}_{chunk_index}.csv"
         chunk_file_path = os.path.join(output_dir, chunk_filename)
 
-        with open(chunk_file_path, "w", newline="") as chunk_file:
+        with open(chunk_file_path, "w", newline="", encoding="utf-8") as chunk_file:
             writer = csv.writer(chunk_file, quotechar='"', quoting=csv.QUOTE_MINIMAL)
             writer.writerow(headers)
             writer.writerows(chunk)
@@ -344,7 +387,9 @@ def start(csv_path):
     setup_logging("./script.log")
     args = parse_arguments(csv_path)
     uploader = CsvUploader(args)
-    uploader.process_and_upload_chunks()
+    ok = uploader.process_and_upload_chunks()
+    if not ok:
+        sys.exit(1)
 
 
 def main():
